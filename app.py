@@ -61,7 +61,7 @@ def _extract(target: str, extra_opts: Optional[dict] = None) -> Optional[dict]:
         "skip_download": True,
         "extract_flat": False,
         "noplaylist": True,
-        "format": "bestaudio/best",
+        "format": "bestaudio/best/18",
     }
     cookie_file = get_cookie_file()
     if cookie_file:
