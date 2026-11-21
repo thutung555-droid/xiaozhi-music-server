@@ -38,33 +38,58 @@ def find_ffmpeg() -> str:
 FFMPEG_BIN = find_ffmpeg()
 
 
-def search_youtube(query: str) -> Optional[dict]:
+def _extract(prefix: str, query: str, extra_opts: Optional[dict] = None) -> Optional[dict]:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "extract_flat": False,
-        "default_search": "ytsearch1",
         "noplaylist": True,
         "format": "bestaudio/best",
     }
+    if extra_opts:
+        ydl_opts.update(extra_opts)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+        info = ydl.extract_info(f"{prefix}{query}", download=False)
         if not info:
             return None
         entries = info.get("entries")
         if entries:
             info = entries[0]
-        if not info:
+        if not info or not info.get("url"):
             return None
         return {
-            "id": info.get("id") or hashlib.md5(query.encode()).hexdigest()[:12],
+            "id": str(info.get("id") or hashlib.md5(query.encode()).hexdigest()[:12]),
             "title": info.get("title") or query,
-            "artist": info.get("uploader") or info.get("channel") or "YouTube",
+            "artist": info.get("uploader") or info.get("channel") or "Music",
             "duration": int(info.get("duration") or 0),
-            "webpage_url": info.get("webpage_url") or f"https://www.youtube.com/watch?v={info.get('id')}",
+            "webpage_url": info.get("webpage_url") or "",
             "stream_url": info.get("url"),
         }
+
+
+def search_youtube(query: str) -> Optional[dict]:
+    # 1. Try YouTube with android/tv client first
+    try:
+        res = _extract(
+            "ytsearch1:",
+            query,
+            {"extractor_args": {"youtube": {"player_client": ["android", "tv"]}}},
+        )
+        if res:
+            return res
+    except Exception as e:
+        print(f"[ytsearch] failed: {e}")
+
+    # 2. Fallback to SoundCloud (works reliably on cloud/datacenter IPs)
+    try:
+        res = _extract("scsearch1:", query)
+        if res:
+            return res
+    except Exception as e:
+        print(f"[scsearch] failed: {e}")
+
+    return None
 
 
 @app.get("/")
