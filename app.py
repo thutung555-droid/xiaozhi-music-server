@@ -2,23 +2,38 @@ import hashlib
 import os
 import shutil
 import subprocess
-import time
 from pathlib import Path
 from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 import yt_dlp
+from ytmusicapi import YTMusic
 
-app = FastAPI(title="Xiaozhi Music Server", version="1.0.0")
+app = FastAPI(title="Xiaozhi Music Server", version="1.1.0")
 
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "/tmp/xiaozhi_music_cache"))
 if os.name == "nt":
     CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(Path.home() / ".xiaozhi_music_cache")))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+COOKIE_PATH = CACHE_DIR / "cookies.txt"
+
 # In-memory index: track_id -> metadata
 TRACKS: Dict[str, dict] = {}
+
+
+def get_cookie_file() -> Optional[str]:
+    cookies_env = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if cookies_env:
+        # Handle escaped newlines if pasted as a single line
+        if "\\n" in cookies_env and "\n" not in cookies_env:
+            cookies_env = cookies_env.replace("\\n", "\n")
+        COOKIE_PATH.write_text(cookies_env + "\n", encoding="utf-8")
+        return str(COOKIE_PATH)
+    if COOKIE_PATH.exists() and COOKIE_PATH.stat().st_size > 0:
+        return str(COOKIE_PATH)
+    return None
 
 
 def find_ffmpeg() -> str:
@@ -36,9 +51,10 @@ def find_ffmpeg() -> str:
 
 
 FFMPEG_BIN = find_ffmpeg()
+YTM = YTMusic()
 
 
-def _extract(prefix: str, query: str, extra_opts: Optional[dict] = None) -> Optional[dict]:
+def _extract(target: str, extra_opts: Optional[dict] = None) -> Optional[dict]:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -47,10 +63,13 @@ def _extract(prefix: str, query: str, extra_opts: Optional[dict] = None) -> Opti
         "noplaylist": True,
         "format": "bestaudio/best",
     }
+    cookie_file = get_cookie_file()
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
     if extra_opts:
         ydl_opts.update(extra_opts)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"{prefix}{query}", download=False)
+        info = ydl.extract_info(target, download=False)
         if not info:
             return None
         entries = info.get("entries")
@@ -58,33 +77,56 @@ def _extract(prefix: str, query: str, extra_opts: Optional[dict] = None) -> Opti
             info = entries[0]
         if not info or not info.get("url"):
             return None
+        artists = info.get("artists")
+        artist_name = (
+            ", ".join(artists)
+            if isinstance(artists, list) and artists
+            else (info.get("uploader") or info.get("channel") or "Music")
+        )
         return {
-            "id": str(info.get("id") or hashlib.md5(query.encode()).hexdigest()[:12]),
-            "title": info.get("title") or query,
-            "artist": info.get("uploader") or info.get("channel") or "Music",
+            "id": str(info.get("id") or hashlib.md5(target.encode()).hexdigest()[:12]),
+            "title": info.get("title") or "Unknown",
+            "artist": artist_name,
             "duration": int(info.get("duration") or 0),
             "webpage_url": info.get("webpage_url") or "",
             "stream_url": info.get("url"),
         }
 
 
-def search_youtube(query: str) -> Optional[dict]:
-    # 1. Try YouTube with android/tv client first
+def search_music(query: str) -> Optional[dict]:
+    # 1. Try YouTube Music first (clean audio tracks, no MV intros)
     try:
-        res = _extract(
-            "ytsearch1:",
-            query,
-            {"extractor_args": {"youtube": {"player_client": ["android", "tv"]}}},
-        )
+        results = YTM.search(query, filter="songs", limit=1)
+        if not results:
+            results = YTM.search(query, filter="videos", limit=1)
+        if results and results[0].get("videoId"):
+            vid = results[0]["videoId"]
+            res = _extract(f"https://music.youtube.com/watch?v={vid}")
+            if res:
+                if results[0].get("title"):
+                    res["title"] = results[0]["title"]
+                ytm_artists = results[0].get("artists")
+                if isinstance(ytm_artists, list) and ytm_artists:
+                    res["artist"] = ", ".join(a.get("name", "") for a in ytm_artists if a.get("name"))
+                res["source"] = "ytmusic"
+                return res
+    except Exception as e:
+        print(f"[ytmusic] failed: {e}")
+
+    # 2. Try YouTube search
+    try:
+        res = _extract(f"ytsearch1:{query}")
         if res:
+            res["source"] = "youtube"
             return res
     except Exception as e:
         print(f"[ytsearch] failed: {e}")
 
-    # 2. Fallback to SoundCloud (works reliably on cloud/datacenter IPs)
+    # 3. Fallback to SoundCloud (works reliably without cookies)
     try:
-        res = _extract("scsearch1:", query)
+        res = _extract(f"scsearch1:{query}")
         if res:
+            res["source"] = "soundcloud"
             return res
     except Exception as e:
         print(f"[scsearch] failed: {e}")
@@ -96,8 +138,9 @@ def search_youtube(query: str) -> Optional[dict]:
 def root():
     return {
         "status": "ok",
-        "service": "Xiaozhi Music Server (YouTube -> MP3)",
+        "service": "Xiaozhi Music Server (YouTube Music + SoundCloud -> MP3)",
         "ffmpeg": FFMPEG_BIN,
+        "cookies_loaded": bool(get_cookie_file()),
         "cached_tracks": len(TRACKS),
     }
 
@@ -116,7 +159,7 @@ def stream_pcm(
     if not query:
         raise HTTPException(status_code=400, detail="Missing song parameter")
 
-    track = search_youtube(query)
+    track = search_music(query)
     if not track or not track.get("stream_url"):
         raise HTTPException(status_code=404, detail=f"Song not found: {query}")
 
@@ -130,6 +173,7 @@ def stream_pcm(
             "duration": track["duration"],
             "audio_url": f"/audio/{track_id}.mp3",
             "lyric_url": "",
+            "source": track.get("source", "unknown"),
         }
     )
 
@@ -146,12 +190,11 @@ def get_audio(track_id: str):
 
     stream_url = track.get("stream_url")
     if not stream_url:
-        refreshed = search_youtube(track.get("webpage_url") or track["title"])
+        refreshed = search_music(track.get("webpage_url") or track["title"])
         if not refreshed or not refreshed.get("stream_url"):
             raise HTTPException(status_code=502, detail="Failed to resolve audio stream")
         stream_url = refreshed["stream_url"]
 
-    # Transcode to 128kbps 44.1kHz stereo/mono MP3 compatible with ESP32-S3 MP3 decoder
     cmd = [
         FFMPEG_BIN,
         "-hide_banner",
